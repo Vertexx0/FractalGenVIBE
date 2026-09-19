@@ -1,14 +1,14 @@
 /**
- * Builds sponge meshes off the main thread. Level 4 is ~160k cubes, and doing
- * that work inline would freeze the UI on a phone for long enough to look like
- * a crash — here the spinner keeps animating and touch stays responsive.
+ * Builds sponge meshes off the main thread. A region can run to 200k cubes, and
+ * doing that work inline would freeze the UI on a phone for long enough to look
+ * like a crash — here the spinner keeps animating and touch stays responsive.
  */
-import { buildSurfaceMesh } from './menger.js';
+import { buildRegionMesh } from './menger.js';
 
 self.onmessage = (event) => {
-  const { id, level } = event.data;
+  const { id, params } = event.data;
   try {
-    const mesh = buildSurfaceMesh(level);
+    const mesh = buildRegionMesh(params);
     self.postMessage({ id, mesh }, [
       mesh.positions.buffer,
       mesh.normals.buffer,

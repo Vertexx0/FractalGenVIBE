@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildSponge, buildSurfaceMesh, occupancyGrid, spongeStats,
-  SUBCELL_OFFSETS, FACES, MAX_LEVEL, FRACTAL_DIMENSION,
+  buildSponge, buildSurfaceMesh, buildRegionMesh, occupancyGrid, spongeStats,
+  isSolidCell, raycastSponge, SUBCELL_OFFSETS, FACES, MAX_LEVEL, FRACTAL_DIMENSION,
 } from '../src/menger.js';
 import { toBinarySTL, toOBJChunks, stlByteLength, formatBytes } from '../src/exporters.js';
 
@@ -212,4 +212,113 @@ test('formatBytes reads sensibly', () => {
   assert.equal(formatBytes(512), '512 B');
   assert.equal(formatBytes(2048), '2 KB');
   assert.equal(formatBytes(5 * 1048576), '5.0 MB');
+});
+
+test('a cell is solid iff the recursive build kept it', () => {
+  const sponge = buildSponge(2);
+  const kept = new Set();
+  for (let i = 0; i < sponge.count * 3; i += 3) {
+    kept.add(`${sponge.cells[i]},${sponge.cells[i + 1]},${sponge.cells[i + 2]}`);
+  }
+  for (let x = 0; x < 9; x++) {
+    for (let y = 0; y < 9; y++) {
+      for (let z = 0; z < 9; z++) {
+        assert.equal(isSolidCell(x, y, z, 2), kept.has(`${x},${y},${z}`), `${x},${y},${z}`);
+      }
+    }
+  }
+  assert.equal(isSolidCell(-1, 0, 0, 2), false);
+  assert.equal(isSolidCell(9, 0, 0, 2), false);
+});
+
+test('a region covering everything equals the full surface mesh', () => {
+  for (let level = 0; level <= 3; level++) {
+    const whole = buildSurfaceMesh(level);
+    const region = buildRegionMesh({ depth: level, center: [0, 0, 0], halfExtent: 0.5 });
+    assert.equal(region.cubeCount, whole.cubeCount);
+    assert.equal(region.faceCount, whole.faceCount);
+    assert.equal(region.depth, level);
+  }
+});
+
+test('a region generates only the cubes that overlap it', () => {
+  // Offset from the axes: the middle of the +x face is the level-1 hole, and a
+  // region inside that hole is legitimately empty.
+  const slab = buildRegionMesh({ depth: 3, center: [0.4, -0.4, -0.4], halfExtent: 0.1 });
+  const whole = buildRegionMesh({ depth: 3, center: [0, 0, 0], halfExtent: 0.5 });
+  assert.ok(slab.cubeCount > 0, 'region should not be empty');
+  assert.ok(slab.cubeCount < whole.cubeCount / 4, `expected a small slice, got ${slab.cubeCount}`);
+  // Positions are relative to the region centre, so they stay near zero. A cube
+  // straddling the edge is emitted whole, so allow one cube's overhang.
+  const limit = 0.1 + 3 ** -3 + 1e-6;
+  for (let i = 0; i < slab.positions.length; i++) {
+    assert.ok(Math.abs(slab.positions[i]) <= limit, `${slab.positions[i]} outside the region`);
+  }
+});
+
+test('a region inside the hollow centre comes back empty', () => {
+  const hole = buildRegionMesh({ depth: 3, center: [0, 0, 0], halfExtent: 0.05 });
+  assert.equal(hole.cubeCount, 0);
+  assert.equal(hole.faceCount, 0);
+  assert.equal(hole.positions.length, 0);
+});
+
+test('region faces are culled against neighbours outside the region', () => {
+  // A single interior cube's region: the cube sits against solid neighbours, so
+  // far fewer than six faces may show. Culling must not stop at the region wall.
+  const region = buildRegionMesh({ depth: 2, center: [0, 0, 0], halfExtent: 0.5 });
+  const slice = buildRegionMesh({ depth: 2, center: [-0.44, -0.44, -0.44], halfExtent: 0.02 });
+  assert.equal(slice.cubeCount, 1, 'expected exactly one cube in the slice');
+  assert.equal(slice.faceCount, 3, 'a corner cube shows three faces, not six');
+  assert.ok(region.faceCount > slice.faceCount);
+});
+
+test('the budget drops depth rather than blowing up', () => {
+  const tight = buildRegionMesh({ depth: 4, center: [0, 0, 0], halfExtent: 0.5, budget: 1000 });
+  assert.ok(tight.depth < 4, `expected a coarser depth, got ${tight.depth}`);
+  assert.ok(tight.cubeCount <= 1000, `expected at most 1000 cubes, got ${tight.cubeCount}`);
+});
+
+test('deep zoom stays cheap and keeps float32 precision', () => {
+  // A cube at depth 12 is 2e-6 wide — far below what float32 resolves at 0.5,
+  // so this only works because vertices come out relative to the centre.
+  const center = [0.5, -0.4, -0.4];
+  const deep = buildRegionMesh({ depth: 12, center, halfExtent: 2e-5, budget: 120000 });
+  assert.equal(deep.depth, 12);
+  assert.ok(deep.cubeCount > 0 && deep.cubeCount <= 120000);
+  const step = 3 ** -12;
+  const seen = new Set();
+  for (let i = 0; i < deep.positions.length; i += 3) seen.add(deep.positions[i]);
+  assert.ok(seen.size > 4, 'x coordinates collapsed — precision was lost');
+  // Distinct coordinates must still be a whole cube apart, not smeared together.
+  const sorted = [...seen].sort((a, b) => a - b);
+  const gap = sorted[1] - sorted[0];
+  assert.ok(Math.abs(gap - step) < step * 0.02, `cube edge came out ${gap}, expected ${step}`);
+});
+
+test('the sponge grows self-similar: zooming in costs the same at any depth', () => {
+  const center = [0.5, -0.4, -0.4];
+  const counts = [6, 9, 12].map((depth) => buildRegionMesh({
+    depth, center, halfExtent: 1.4 * (2.2 / 3 ** (depth - 3)) * Math.tan(23 * Math.PI / 180),
+    budget: 200000,
+  }).cubeCount);
+  for (const count of counts) assert.ok(count > 100, `too few cubes: ${count}`);
+  // Not bit-identical: the region's edges land differently against the grid at
+  // each depth. The property that matters is that the cost does not grow.
+  const spread = Math.max(...counts) / Math.min(...counts);
+  assert.ok(spread < 1.2, `cost drifted across depths: ${counts}`);
+});
+
+test('raycast finds the surface, and misses through a tunnel', () => {
+  // Straight down the x axis is the level-1 face hole: it goes clean through.
+  assert.equal(raycastSponge([2, 0, 0], [-1, 0, 0], 2), null);
+  // Offset into solid material, the ray should stop at the +x face.
+  const hit = raycastSponge([2, -0.4, -0.4], [-1, 0, 0], 2);
+  assert.ok(hit, 'expected a hit on the +x face');
+  assert.ok(Math.abs(hit[0] - 0.5) < 0.02, `hit at x=${hit[0]}, expected the face at 0.5`);
+  assert.ok(isSolidCell(...[0, 1, 2].map((a) => Math.floor((hit[a] + 0.5) * 9)), 2));
+});
+
+test('raycast returns null when the ray never meets the cube', () => {
+  assert.equal(raycastSponge([2, 2, 2], [1, 0, 0], 2), null);
 });

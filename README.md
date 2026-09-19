@@ -15,7 +15,8 @@ because ES modules and module workers are blocked on `file://`.
 
 ## What it does
 
-- **Iterations 0–4**, with the cube count and warning shown as you go.
+- **Iterations 0–4** at rest, with the cube count and warning shown as you go.
+- **Zoom to 531,441×**, generating new iterations as you dive — see below.
 - **Four palettes.** `Depth` and `Ember` shade by distance from the centre, so
   the outer shell and the tunnel walls read as different surfaces; `Axis` maps
   x/y/z straight to red/green/blue; `Bone` is near-white.
@@ -43,8 +44,44 @@ than a surface, less than a solid.
 | 3 | 8,000 | 36,096 | 40.6% | 1.7 MB |
 | 4 | 160,000 | 672,768 | 30.1% | 32.1 MB |
 
-Level 4 is the interactive ceiling. The geometry core will build level 5
-(3.2 million cubes) for offline use, but no phone should be asked to orbit it.
+Level 4 is the ceiling for building the sponge *whole*. The geometry core will
+build level 5 (3.2 million cubes) for offline use, but no phone should be asked
+to orbit it. Zoom goes far deeper by never building the whole thing.
+
+## Zooming forever
+
+The zoom slider adds **one iteration per 3× of magnification**, which is the
+natural rate: each iteration cuts a cube into thirds, so cubes hold a steady
+size on screen however far you dive. At the end of the slider you are at
+531,441× and depth 15 — a sponge of 3.3 × 10¹⁹ cubes, if anyone could build one.
+
+Nobody builds one. Three things make the dive affordable:
+
+- **Only the region in front of the camera is generated.** The subdivision tree
+  is pruned at every level against a box a little wider than the view, so the
+  work tracks what you can see rather than 20ⁿ. Because the region shrinks at
+  the same rate the depth grows, a view costs the same at 1× as at 500,000× —
+  measurably so: past 81× the builder settles at a near-constant cube count.
+- **Faces are culled against cubes that were never generated.** A neighbour's
+  solidity comes from the closed form — a cell survives exactly when no base-3
+  digit triple of its coordinates holds two or more ones — so the region's own
+  walls are not mistaken for surface. An occupancy grid would need 27ⁿ bytes.
+- **The origin travels with the view.** At depth 15 a cube is 7 × 10⁻⁸ of the
+  sponge wide, far below what float32 resolves near a coordinate of 0.5.
+  Vertices come out relative to the region's centre, so the mantissa is spent on
+  detail instead of on position. The near and far planes are rescaled each frame
+  for the same reason: fixed ones span eight orders of magnitude at full zoom
+  and the depth buffer resolves none of it.
+
+**Tap the sponge to aim.** Zoom dives toward the point you last aimed at, and
+the first dive aims down the middle of the screen for you. The app also re-aims
+on its own each time the depth increases, and it has to: the sponge has zero
+volume, so a point that is solid at depth 5 has almost certainly been carved
+away by depth 15. Without that, a deep dive lands in a hole and builds nothing.
+
+A budget (120k cubes on touch devices, 220k otherwise) is the backstop. If a
+region turns out denser than that, the builder drops a level on its own rather
+than handing the GPU something it cannot hold.
 
 ## Why it stays fast on a phone
 
@@ -62,6 +99,9 @@ Level 4 is the interactive ceiling. The geometry core will build level 5
   wall on mobile, not triangle count.
 - **The camera frames itself** against whatever canvas the sheet is not
   covering, so the model is never hidden behind the controls.
+- **Palettes rescale to the region.** Shading by distance from the sponge's
+  centre collapses to one flat tone once a slice sits entirely at one distance
+  from it, so the ramp is stretched over the range actually present.
 
 ## Layout
 
@@ -90,10 +130,17 @@ npm run smoke  # drives the real page in Chromium at both sizes
 The unit tests check the build against the independent base-3 digit rule for
 sponge membership, the sponge's symmetry under axis swaps and reflection, that
 face windings point outward, that no edge in the surface mesh is left dangling,
-and that STL and OBJ come out the size and shape they claim to be.
+and that STL and OBJ come out the size and shape they claim to be. For the
+zoomed builder they also check that a full-cube region reproduces the whole
+mesh exactly, that faces are still culled against cubes outside the region,
+that the budget lowers the depth instead of overrunning, that a depth-12 slice
+keeps whole cube edges in float32 rather than collapsing, and that the cost of
+a region does not drift as it descends.
 
 The smoke test boots the page, checks the model is actually drawn, drags to
-orbit, switches palettes, opens a cutaway, builds level 4, downloads all three
+orbit, switches palettes, opens a cutaway, dives the zoom slider to 531,441×
+(confirming the depth follows, the focus lands on a surface, the cost stays
+bounded and something is still on screen), builds level 4, downloads all three
 export formats and reloads to confirm the URL state restores. It serves three.js
 from the local `node_modules` copy, so it runs offline.
 

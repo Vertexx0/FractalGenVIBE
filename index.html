@@ -56,6 +56,16 @@
         <button id="level-up" type="button" aria-label="More iterations">+</button>
       </div>
       <p id="level-note" class="note">8,000 cubes</p>
+      <p class="note">Detail at 1&times;. Zooming in adds one iteration per 3&times;.</p>
+    </div>
+
+    <div class="field">
+      <div class="field__head">
+        <label for="zoom">Zoom</label>
+        <output id="zoom-out" for="zoom">1&times;</output>
+      </div>
+      <input id="zoom" type="range" min="0" max="1000" step="1" value="0" aria-describedby="zoom-note">
+      <p id="zoom-note" class="note">Depth 3 &middot; tap the sponge to aim</p>
     </div>
 
     <div class="field">
@@ -93,7 +103,8 @@
         <button id="save-stl" class="btn" type="button">STL</button>
         <button id="save-obj" class="btn" type="button">OBJ</button>
       </div>
-      <p class="note">STL and OBJ are watertight-wound surface meshes, 100&nbsp;mm across.</p>
+      <p class="note">STL and OBJ export whatever is built, scaled to 100&nbsp;mm across &mdash;
+      zoomed in, that is the slice you are looking at.</p>
     </div>
 
   </div>

@@ -14,10 +14,18 @@
 export const KEPT_PER_STEP = 20;
 
 /**
- * Highest level this module will build. 20^6 cubes would need gigabytes; 5 is
- * already 3.2M cubes and is meant for offline export rather than interaction.
+ * Highest level this module will build in one piece. 20^6 cubes would need
+ * gigabytes; 5 is already 3.2M cubes and is meant for offline export rather
+ * than interaction.
  */
 export const MAX_LEVEL = 5;
+
+/**
+ * Depth ceiling for region builds. Cell coordinates run to 3^depth and must
+ * stay exact integers, so the real wall is float64's 2^53 at depth 33; 18 is
+ * well inside it and already a 3^18 (387 million) cube grid.
+ */
+export const HARD_MAX_DEPTH = 18;
 
 /** Hausdorff dimension of the sponge: log(20) / log(3). */
 export const FRACTAL_DIMENSION = Math.log(20) / Math.log(3);
@@ -111,61 +119,146 @@ export function occupancyGrid(sponge) {
 }
 
 /**
- * Surface mesh of a sponge, with every face shared by two solid cubes dropped.
+ * Is the cell (x, y, z) on the 3^depth grid part of the sponge?
  *
- * Culling those hidden faces is the difference between a mesh that a phone can
- * spin and one that it cannot: at level 4 it removes roughly three quarters of
- * the triangles a naive cube-per-cell mesh would carry, and it keeps exported
- * STL files to a size a slicer will open.
- *
- * Positions are normalised so the sponge spans [-0.5, 0.5] on every axis.
- *
- * @param {number} level
- * @returns {{level: number, gridSize: number, cubeCount: number, faceCount: number,
- *            positions: Float32Array, normals: Float32Array, indices: Uint32Array}}
+ * The recursive definition has a closed form: a cell survives exactly when no
+ * base-3 digit triple of its coordinates contains two or more ones. That is an
+ * O(depth) test against a sponge of any depth, which is what lets the zoomed
+ * builder cull faces against neighbours it never generated — an occupancy grid
+ * would need 27^depth bytes and is hopeless past level 5.
  */
-export function buildSurfaceMesh(level) {
-  const sponge = buildSponge(level);
-  const { gridSize, cells, count } = sponge;
-  const grid = occupancyGrid(sponge);
+export function isSolidCell(x, y, z, depth) {
+  if (x < 0 || y < 0 || z < 0) return false;
+  const size = 3 ** depth;
+  if (x >= size || y >= size || z >= size) return false;
+  for (let d = 0; d < depth; d++) {
+    if ((x % 3 === 1) + (y % 3 === 1) + (z % 3 === 1) >= 2) return false;
+    x = Math.floor(x / 3);
+    y = Math.floor(y / 3);
+    z = Math.floor(z / 3);
+  }
+  return true;
+}
 
-  // Pass one counts exposed faces so the typed arrays are allocated exactly once.
-  let faceCount = 0;
-  for (let i = 0; i < count * 3; i += 3) {
-    const x = cells[i], y = cells[i + 1], z = cells[i + 2];
-    for (let f = 0; f < 6; f++) {
-      const [nx, ny, nz] = FACES[f].normal;
-      const ax = x + nx, ay = y + ny, az = z + nz;
-      const outside = ax < 0 || ay < 0 || az < 0 ||
-        ax >= gridSize || ay >= gridSize || az >= gridSize;
-      if (outside || !grid[(ax * gridSize + ay) * gridSize + az]) faceCount++;
+/**
+ * Walk the subdivision tree, keeping only branches that overlap the region.
+ *
+ * Pruning at every level is what makes deep zoom affordable: the work is
+ * proportional to the cells actually inside the region, not to the 20^depth
+ * cells of the whole sponge. Returns false if the region holds more than `cap`
+ * cells, so the caller can drop a level and try again.
+ */
+function descend(level, x, y, z, ctx) {
+  const size = 3 ** -level;
+  const lo = [x * size, y * size, z * size];
+  const { min, max } = ctx.box;
+  for (let a = 0; a < 3; a++) {
+    if (lo[a] >= max[a] || lo[a] + size <= min[a]) return true;
+  }
+  if (level === ctx.depth) {
+    ctx.cells.push(x, y, z);
+    return ctx.cells.length <= ctx.cap * 3;
+  }
+  for (let o = 0; o < SUBCELL_OFFSETS.length; o += 3) {
+    const ok = descend(
+      level + 1,
+      x * 3 + SUBCELL_OFFSETS[o],
+      y * 3 + SUBCELL_OFFSETS[o + 1],
+      z * 3 + SUBCELL_OFFSETS[o + 2],
+      ctx,
+    );
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/**
+ * Surface mesh for the part of the sponge inside an axis-aligned region, at
+ * whatever depth fits the budget.
+ *
+ * Faces shared by two solid cubes are dropped, which at level 4 is 673k
+ * triangles instead of 1.92M. Neighbours outside the region still count as
+ * solid, so the region's own walls are not mistaken for surface.
+ *
+ * Vertices come out **relative to `center`**. That is not a convenience: at
+ * depth 12 a cube is 2e-6 wide, and absolute float32 coordinates would quantise
+ * the whole thing to nothing. Keeping the origin at the region's centre leaves
+ * the full float32 mantissa for detail, at any zoom.
+ *
+ * @param {object} options
+ * @param {number} options.depth     Requested depth; lowered until it fits.
+ * @param {number[]} [options.center]     Region centre in world space, [-0.5, 0.5].
+ * @param {number} [options.halfExtent]   Half the region's edge, world units.
+ * @param {number} [options.budget]       Maximum cubes to generate.
+ */
+export function buildRegionMesh({
+  depth,
+  center = [0, 0, 0],
+  halfExtent = 0.5,
+  budget = 260000,
+} = {}) {
+  assertLevel(depth, HARD_MAX_DEPTH);
+
+  // World [-0.5, 0.5] maps to the unit cube the descent works in.
+  const box = {
+    min: center.map((c) => c - halfExtent + 0.5),
+    max: center.map((c) => c + halfExtent + 0.5),
+  };
+
+  let cells = null;
+  while (depth >= 0) {
+    const ctx = { depth, box, cells: [], cap: budget };
+    if (descend(0, 0, 0, 0, ctx)) {
+      cells = ctx.cells;
+      break;
     }
+    depth--;   // too dense for the budget: one level coarser
   }
 
-  const positions = new Float32Array(faceCount * 4 * 3);
-  const normals = new Float32Array(faceCount * 4 * 3);
+  const count = cells.length / 3;
+  const gridSize = 3 ** depth;
+
+  // Mark exposed faces once, so the fill pass does not redo the digit tests.
+  const masks = new Uint8Array(count);
+  let faceCount = 0;
+  for (let i = 0; i < count; i++) {
+    const x = cells[i * 3], y = cells[i * 3 + 1], z = cells[i * 3 + 2];
+    let mask = 0;
+    for (let f = 0; f < 6; f++) {
+      const n = FACES[f].normal;
+      if (!isSolidCell(x + n[0], y + n[1], z + n[2], depth)) {
+        mask |= 1 << f;
+        faceCount++;
+      }
+    }
+    masks[i] = mask;
+  }
+
+  const positions = new Float32Array(faceCount * 12);
+  const normals = new Float32Array(faceCount * 12);
   const indices = new Uint32Array(faceCount * 6);
   const scale = 1 / gridSize;
+  // Folded into the per-vertex sum so the shift to local space happens in
+  // double precision, before anything is narrowed to float32.
+  const shift = [-0.5 - center[0], -0.5 - center[1], -0.5 - center[2]];
 
-  let p = 0, n = 0, t = 0, vertex = 0;
-  for (let i = 0; i < count * 3; i += 3) {
-    const x = cells[i], y = cells[i + 1], z = cells[i + 2];
+  let p = 0, nOff = 0, t = 0, vertex = 0;
+  for (let i = 0; i < count; i++) {
+    const mask = masks[i];
+    if (mask === 0) continue;
+    const x = cells[i * 3], y = cells[i * 3 + 1], z = cells[i * 3 + 2];
     for (let f = 0; f < 6; f++) {
+      if ((mask & (1 << f)) === 0) continue;
       const face = FACES[f];
-      const [nx, ny, nz] = face.normal;
-      const ax = x + nx, ay = y + ny, az = z + nz;
-      const outside = ax < 0 || ay < 0 || az < 0 ||
-        ax >= gridSize || ay >= gridSize || az >= gridSize;
-      if (!outside && grid[(ax * gridSize + ay) * gridSize + az]) continue;
-
+      const n = face.normal;
       for (let c = 0; c < 4; c++) {
-        const [cx, cy, cz] = face.corners[c];
-        positions[p++] = (x + cx) * scale - 0.5;
-        positions[p++] = (y + cy) * scale - 0.5;
-        positions[p++] = (z + cz) * scale - 0.5;
-        normals[n++] = nx;
-        normals[n++] = ny;
-        normals[n++] = nz;
+        const corner = face.corners[c];
+        positions[p++] = (x + corner[0]) * scale + shift[0];
+        positions[p++] = (y + corner[1]) * scale + shift[1];
+        positions[p++] = (z + corner[2]) * scale + shift[2];
+        normals[nOff++] = n[0];
+        normals[nOff++] = n[1];
+        normals[nOff++] = n[2];
       }
       indices[t++] = vertex;
       indices[t++] = vertex + 1;
@@ -178,14 +271,73 @@ export function buildSurfaceMesh(level) {
   }
 
   return {
-    level,
+    level: depth,
+    depth,
     gridSize,
     cubeCount: count,
     faceCount,
+    center,
+    halfExtent,
+    cubeSize: scale,
     positions,
     normals,
     indices,
   };
+}
+
+/**
+ * Surface mesh of the whole sponge at `level` — the region builder over the
+ * entire cube.
+ *
+ * @param {number} level
+ */
+export function buildSurfaceMesh(level) {
+  assertLevel(level);
+  return buildRegionMesh({
+    depth: level,
+    center: [0, 0, 0],
+    halfExtent: 0.5,
+    budget: Infinity,
+  });
+}
+
+/**
+ * First point where a ray enters solid sponge, or null if it passes through.
+ *
+ * Used to aim the zoom: the region to generate is centred on whatever surface
+ * you are pointing at, because zooming at the sponge's own centre would only
+ * dive into the hole that was carved out first.
+ *
+ * Marched at half a cell per step rather than traced exactly — this picks a
+ * point to look at, and being half a cube out is invisible.
+ *
+ * @param {number[]} origin     Ray start in world space, the cube spanning [-0.5, 0.5].
+ * @param {number[]} direction  Unit direction.
+ * @param {number} depth        Depth whose cells count as solid.
+ * @param {number} maxDistance  How far along the ray to look.
+ * @returns {number[]|null}
+ */
+export function raycastSponge(origin, direction, depth, maxDistance = 6) {
+  const size = 3 ** depth;
+  // Never fewer steps than a cell is wide, and never more than we can afford.
+  const step = Math.max(0.5 / size, maxDistance / 4000);
+  let entered = false;
+  for (let t = 0; t <= maxDistance; t += step) {
+    const x = origin[0] + direction[0] * t;
+    const y = origin[1] + direction[1] * t;
+    const z = origin[2] + direction[2] * t;
+    const inside = x >= -0.5 && x <= 0.5 && y >= -0.5 && y <= 0.5 && z >= -0.5 && z <= 0.5;
+    if (!inside) {
+      if (entered) break;   // came out the far side without hitting anything
+      continue;
+    }
+    entered = true;
+    const gx = Math.floor((x + 0.5) * size);
+    const gy = Math.floor((y + 0.5) * size);
+    const gz = Math.floor((z + 0.5) * size);
+    if (isSolidCell(gx, gy, gz, depth)) return [x, y, z];
+  }
+  return null;
 }
 
 /**

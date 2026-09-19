@@ -72,8 +72,10 @@ async function canvasHasModel(page) {
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     let lit = 0;
     for (let i = 0; i < pixels.length; i += 4) {
-      // Anything clearly brighter than the #0b0d12 background.
-      if (pixels[i] + pixels[i + 1] + pixels[i + 2] > 120) lit++;
+      // Anything that differs from the #0b0d12 background, however dimly lit.
+      const off = Math.abs(pixels[i] - 11) + Math.abs(pixels[i + 1] - 13)
+        + Math.abs(pixels[i + 2] - 18);
+      if (off > 24) lit++;
     }
     return lit / (w * h);
   });
@@ -98,6 +100,7 @@ async function run(name, contextOptions) {
   console.log(`       stats: ${stats}`);
   check(stats.includes('8,000 cubes'), 'default level 3 reports 8,000 cubes');
   check(stats.includes('36,096 tris'), 'culled mesh reports 36,096 triangles');
+  check(stats.includes('depth 3'), 'stats report the build depth');
 
   const coverage = await canvasHasModel(page);
   console.log(`       lit pixels: ${(coverage * 100).toFixed(1)}%`);
@@ -165,6 +168,56 @@ async function run(name, contextOptions) {
   await page.fill('#cut', '0');
   await page.dispatchEvent('#cut', 'input');
 
+  // Zoom: the slider must dive, deepen, and keep the cost bounded.
+  const atRest = await page.evaluate(() => ({
+    zoom: window.__menger.zoom, depth: window.__menger.depth, faces: window.__menger.faceCount,
+  }));
+  check(Math.abs(atRest.zoom - 1) < 0.02, `starts at 1x (${atRest.zoom.toFixed(2)})`);
+  check(atRest.depth === 3, `starts at depth 3 (got ${atRest.depth})`);
+
+  const dives = [];
+  for (const slider of [250, 500, 750, 1000]) {
+    await page.fill('#zoom', String(slider));
+    await page.dispatchEvent('#zoom', 'input');
+    await page.waitForFunction(
+      (want) => !document.getElementById('save-stl').disabled
+        && window.__menger.depth >= want,
+      3 + Math.round(Math.log(3 ** (12 * slider / 1000)) / Math.log(3)) - 1,
+      { timeout: 30000 },
+    );
+    dives.push(await page.evaluate(() => ({
+      zoom: window.__menger.zoom,
+      depth: window.__menger.depth,
+      faces: window.__menger.faceCount,
+      focus: window.__menger.focus,
+    })));
+  }
+  for (const d of dives) {
+    console.log(`       zoom ${Math.round(d.zoom)}x -> depth ${d.depth}, ${d.faces} faces`);
+  }
+  const deepest = dives[dives.length - 1];
+  check(deepest.zoom > 100000, `slider reaches deep zoom (${Math.round(deepest.zoom)}x)`);
+  check(deepest.depth >= 12, `depth follows zoom (${deepest.depth})`);
+  check(
+    deepest.focus.some((v) => v !== 0),
+    `zoom aimed at the surface (${deepest.focus.map((v) => v.toFixed(3))})`,
+  );
+  const worst = Math.max(...dives.map((d) => d.faces));
+  check(worst < 600000, `deep zoom stays bounded (worst ${worst} faces)`);
+  check(await canvasHasModel(page) > 0.02, 'geometry is still drawn at full zoom');
+  await page.screenshot({ path: join(shots, `${name}-zoom.png`) });
+
+  // New detail, not a magnified version of the same cubes.
+  check(
+    deepest.depth > atRest.depth + 8,
+    `zoom generated ${deepest.depth - atRest.depth} extra iterations`,
+  );
+
+  await page.fill('#zoom', '0');
+  await page.dispatchEvent('#zoom', 'input');
+  await page.waitForFunction(() => window.__menger.zoom < 1.02, null, { timeout: 20000 });
+  await page.waitForFunction(() => !document.getElementById('save-stl').disabled, null, { timeout: 20000 });
+
   // Level 4: the heaviest build the UI allows.
   await page.click('#level-up');
   await page.waitForFunction(
@@ -194,7 +247,7 @@ async function run(name, contextOptions) {
     await download.saveAs(file);
     const size = (await readFile(file)).length;
     check(
-      download.suggestedFilename() === `menger-L3.${extension}` && size > 1000,
+      download.suggestedFilename() === `menger-d3.${extension}` && size > 1000,
       `${extension.toUpperCase()} downloads as ${download.suggestedFilename()} (${size} bytes)`,
     );
   }
