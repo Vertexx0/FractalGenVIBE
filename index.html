@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<meta name="description" content="Mobile-first Menger sponge fractal generator: build, spin, slice and export the fractal in your browser.">
+<meta name="mobile-web-app-capable" content="true">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Menger Sponge Generator</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 9'><rect width='9' height='9' fill='%230b0d12'/><g fill='%237cc6ff'><rect x='0' y='0' width='3' height='3'/><rect x='6' y='0' width='3' height='3'/><rect x='0' y='6' width='3' height='3'/><rect x='6' y='6' width='3' height='3'/><rect x='3' y='0' width='3' height='1'/><rect x='3' y='8' width='3' height='1'/><rect x='0' y='3' width='1' height='3'/><rect x='8' y='3' width='1' height='3'/></g></svg>">
+<link rel="stylesheet" href="src/style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<canvas id="view" aria-label="Menger sponge, drag to rotate and pinch to zoom"></canvas>
+
+<header id="hud">
+  <h1>Menger<span>sponge generator</span></h1>
+  <p id="stats" aria-live="polite">&nbsp;</p>
+</header>
+
+<div id="busy" hidden><span class="spinner" aria-hidden="true"></span><span id="busy-label">Building…</span></div>
+
+<div id="boot-error" hidden>
+  <h2>Could not start the 3D view</h2>
+  <p id="boot-error-detail"></p>
+  <p class="hint">This page needs WebGL and loads three.js from a CDN. Open it over
+  <code>http://</code> (for example <code>npm run dev</code>) rather than <code>file://</code>.</p>
+</div>
+
+<section id="sheet" aria-label="Controls">
+  <button id="sheet-toggle" type="button" aria-expanded="true" aria-controls="sheet-body">
+    <span class="grip" aria-hidden="true"></span>
+    <span class="sr-only">Toggle controls</span>
+  </button>
+
+  <div id="sheet-body">
+
+    <div class="field">
+      <div class="field__head">
+        <label for="level">Iterations</label>
+        <output id="level-out" for="level">3</output>
+      </div>
+      <div class="stepper">
+        <button id="level-down" type="button" aria-label="Fewer iterations">−</button>
+        <input id="level" type="range" min="0" max="4" step="1" value="3" aria-describedby="level-note">
+        <button id="level-up" type="button" aria-label="More iterations">+</button>
+      </div>
+      <p id="level-note" class="note">8,000 cubes</p>
+    </div>
+
+    <div class="field">
+      <span class="field__head" id="palette-label">Palette</span>
+      <div class="pills" role="radiogroup" aria-labelledby="palette-label" id="palette">
+        <button type="button" role="radio" data-value="depth" aria-checked="true">Depth</button>
+        <button type="button" role="radio" data-value="axis" aria-checked="false">Axis</button>
+        <button type="button" role="radio" data-value="ember" aria-checked="false">Ember</button>
+        <button type="button" role="radio" data-value="bone" aria-checked="false">Bone</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <div class="field__head">
+        <label for="cut">Cutaway</label>
+        <output id="cut-out" for="cut">off</output>
+      </div>
+      <input id="cut" type="range" min="0" max="100" step="1" value="0">
+      <div class="pills pills--tight" role="radiogroup" aria-label="Cutaway axis" id="cut-axis">
+        <button type="button" role="radio" data-value="x" aria-checked="true">X</button>
+        <button type="button" role="radio" data-value="y" aria-checked="false">Y</button>
+        <button type="button" role="radio" data-value="z" aria-checked="false">Z</button>
+      </div>
+    </div>
+
+    <div class="field row">
+      <button id="spin" class="btn btn--toggle" type="button" aria-pressed="false">Auto-spin</button>
+      <button id="reset" class="btn" type="button">Reset view</button>
+    </div>
+
+    <div class="field">
+      <span class="field__head">Export</span>
+      <div class="row">
+        <button id="save-png" class="btn" type="button">PNG</button>
+        <button id="save-stl" class="btn" type="button">STL</button>
+        <button id="save-obj" class="btn" type="button">OBJ</button>
+      </div>
+      <p class="note">STL and OBJ are watertight-wound surface meshes, 100&nbsp;mm across.</p>
+    </div>
+
+  </div>
+</section>
+
+<p id="toast" role="status" aria-live="polite"></p>
+
+<script>
+  // If the module never runs — no WebGL, a blocked CDN, or opened over file:// —
+  // the page would otherwise sit black and silent.
+  (function () {
+    function fail(detail) {
+      if (window.__mengerBooted) return;
+      document.getElementById('boot-error-detail').textContent = detail;
+      document.getElementById('boot-error').hidden = false;
+      document.getElementById('busy').hidden = true;
+    }
+    window.addEventListener('error', function (event) {
+      if (event.target && event.target.tagName === 'SCRIPT') {
+        fail('A script failed to load: ' + (event.target.src || 'module'));
+      }
+    }, true);
+    setTimeout(function () { fail('three.js did not load within 10 seconds.'); }, 10000);
+  })();
+</script>
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
