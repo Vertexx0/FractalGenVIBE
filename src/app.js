@@ -427,11 +427,9 @@ function currentRegion() {
  * being aimed at was already under the finger. What changes is what the camera
  * pivots and dives towards, and where the next region gets generated.
  */
-function aimAt(ndcX, ndcY, schedule = true) {
+function aimAlong(direction, schedule = true) {
   const region = currentRegion();
   const distance = camera.position.length();
-  const target = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
-  const direction = target.sub(camera.position).normalize();
   const worldCamera = [
     focus[0] + camera.position.x,
     focus[1] + camera.position.y,
@@ -464,6 +462,26 @@ function aimAt(ndcX, ndcY, schedule = true) {
   return true;
 }
 
+/**
+ * Aim down the middle of what the viewer sees.
+ *
+ * Not NDC (0, 0): the view offset that lifts the model clear of the sheet moves
+ * the canvas centre off the view axis, and on a phone that ray misses the
+ * sponge entirely. The camera looks at the local origin, so the axis is it.
+ */
+function aimForward(schedule = true) {
+  return aimAlong(camera.position.clone().negate().normalize(), schedule);
+}
+
+/** Aim at a point the viewer touched. Canvas NDC is right here: three folds the
+ *  view offset into the projection, so unproject already accounts for it. */
+function aimAt(ndcX, ndcY, schedule = true) {
+  // unproject reads matrixWorld, which is otherwise only refreshed at render.
+  camera.updateMatrixWorld();
+  const target = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
+  return aimAlong(target.sub(camera.position).normalize(), schedule);
+}
+
 /** Depth the focus was last checked against; see the re-aim in rebuild(). */
 let aimedDepth = null;
 
@@ -476,10 +494,11 @@ function placeMesh() {
 
 function setZoom(zoom) {
   const next = clamp(zoom, 1, MAX_ZOOM);
+  // Aim first, from out here where the ray still reaches the surface. Diving
+  // before aiming drops the camera into the hollow centre — the first thing the
+  // sponge carves away — and from in there the ray finds nothing to aim at.
+  if (next > 1.15 && focus[0] === 0 && focus[1] === 0 && focus[2] === 0) aimForward(false);
   camera.position.setLength(baseDistance / next);
-  // The first dive has nothing to dive at: the sponge's own centre is the first
-  // hole that was carved out, so aim at the surface ahead before going in.
-  if (next > 1.15 && focus[0] === 0 && focus[1] === 0 && focus[2] === 0) aimAt(0, 0);
   controls.update();
   syncZoomUI();
   scheduleRebuild();
@@ -559,7 +578,7 @@ async function rebuild() {
       // centred on the origin, and aiming there would knock it off centre.
       if (region.depth !== aimedDepth) {
         aimedDepth = region.depth;
-        if (region.depth > state.level && aimAt(0, 0, false)) region = currentRegion();
+        if (region.depth > state.level && aimForward(false)) region = currentRegion();
       }
       setBusy(true, `Building depth ${region.depth}…`);
       try {
