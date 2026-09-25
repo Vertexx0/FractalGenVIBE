@@ -59,27 +59,55 @@ async function routeCDN(context) {
   });
 }
 
-/** Is anything actually drawn, or are we looking at an empty background? */
-async function canvasHasModel(page) {
-  return page.evaluate(() => {
+/**
+ * Fraction of a CSS-pixel rectangle that shows the model rather than the
+ * #0b0d12 background. Defaults to the whole canvas. The drawing buffer is
+ * cleared once a frame is composited, so a fresh frame is forced and read back
+ * in the same task.
+ */
+async function coverage(page, rect = null) {
+  return page.evaluate((rect) => {
     const canvas = document.getElementById('view');
-    // The drawing buffer is cleared once a frame is composited, so force a
-    // fresh render and read it back in the same task.
     window.__menger.render();
     const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl');
     const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
     const pixels = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-    let lit = 0;
-    for (let i = 0; i < pixels.length; i += 4) {
-      // Anything that differs from the #0b0d12 background, however dimly lit.
-      const off = Math.abs(pixels[i] - 11) + Math.abs(pixels[i + 1] - 13)
-        + Math.abs(pixels[i + 2] - 18);
-      if (off > 24) lit++;
+    const sx = w / canvas.clientWidth, sy = h / canvas.clientHeight;
+    const r = rect ?? { x: 0, y: 0, w: canvas.clientWidth, h: canvas.clientHeight };
+    const x0 = Math.floor(r.x * sx), x1 = Math.floor((r.x + r.w) * sx);
+    // readPixels rows run bottom-up.
+    const y0 = Math.floor(h - (r.y + r.h) * sy), y1 = Math.floor(h - r.y * sy);
+    let lit = 0, total = 0;
+    for (let y = Math.max(0, y0); y < Math.min(h, y1); y++) {
+      for (let x = Math.max(0, x0); x < Math.min(w, x1); x++) {
+        const i = (y * w + x) * 4;
+        const off = Math.abs(pixels[i] - 11) + Math.abs(pixels[i + 1] - 13)
+          + Math.abs(pixels[i + 2] - 18);
+        total++;
+        if (off > 24) lit++;
+      }
     }
-    return lit / (w * h);
-  });
+    return lit / Math.max(total, 1);
+  }, rect);
 }
+
+/** Wait until no build is running or queued. */
+async function settle(page, timeout = 45000) {
+  await page.waitForTimeout(250);
+  await page.waitForFunction(
+    () => window.__menger && !window.__menger.building && window.__menger.cubeCount > 0,
+    null, { timeout });
+  await page.waitForTimeout(150);
+}
+
+const probe = (page) => page.evaluate(() => {
+  const m = window.__menger;
+  return {
+    zoom: m.zoom, depth: m.depth, depthMin: m.depthMin, cubes: m.cubeCount,
+    faces: m.faceCount, threshold: m.threshold, focus: m.focus, level: m.state.level,
+  };
+});
 
 async function run(name, contextOptions) {
   console.log(`\n=== ${name} ===`);
@@ -92,19 +120,24 @@ async function run(name, contextOptions) {
 
   await page.goto(origin, { waitUntil: 'load' });
   await page.waitForFunction(() => window.__mengerBooted === true, null, { timeout: 20000 });
-  await page.waitForFunction(() => /cubes/.test(document.getElementById('stats').textContent));
-  await page.waitForTimeout(600);
+  await settle(page);
 
   check(await page.locator('#boot-error').isHidden(), 'no boot error');
-  const stats = await page.locator('#stats').textContent();
-  console.log(`       stats: ${stats}`);
-  check(stats.includes('8,000 cubes'), 'default level 3 reports 8,000 cubes');
-  check(stats.includes('36,096 tris'), 'culled mesh reports 36,096 triangles');
-  check(stats.includes('depth 3'), 'stats report the build depth');
+  const rest = await probe(page);
+  console.log(`       stats: ${await page.locator('#stats').textContent()}`);
+  check(rest.level === 5, `starts at iteration level 5 (got ${rest.level})`);
+  // Detail stops at whichever comes first: the budget, which leaves several
+  // depths on screen, or the 2.5 px floor, below which splitting adds nothing
+  // you can see — on a phone the whole sponge is only ~330 px tall at 1x.
+  const atFloor = rest.threshold <= 2.51;
+  check(rest.depth - rest.depthMin >= 1 || atFloor,
+    `detail runs to the budget or the pixel floor (${rest.depthMin}-${rest.depth}, ${rest.threshold.toFixed(1)} px)`);
+  check(rest.depth >= 4, `at least four iterations at rest (depth ${rest.depth})`);
+  check(rest.threshold <= 8, `finest cubes are small on screen (${rest.threshold.toFixed(1)} px)`);
 
-  const coverage = await canvasHasModel(page);
-  console.log(`       lit pixels: ${(coverage * 100).toFixed(1)}%`);
-  check(coverage > 0.02, 'sponge is visibly rendered');
+  const full = await coverage(page);
+  console.log(`       lit pixels: ${(full * 100).toFixed(1)}%`);
+  check(full > 0.02, 'sponge is visibly rendered');
   await page.screenshot({ path: join(shots, `${name}-default.png`) });
 
   // Touch targets must clear the 44px guideline on a phone.
@@ -120,7 +153,6 @@ async function run(name, contextOptions) {
     () => getComputedStyle(document.getElementById('view')).touchAction);
   check(touchAction === 'none', 'canvas owns touch gestures');
 
-  // Rotate by dragging, and confirm the camera actually moved.
   // Drag to orbit. The press has to land on open canvas: on a phone the sheet
   // covers the lower half, on desktop the panel covers the left edge.
   const view = page.viewportSize();
@@ -139,108 +171,113 @@ async function run(name, contextOptions) {
   await page.waitForTimeout(600);
   const camAfter = await page.evaluate(() => window.__menger.camera);
   const after = await page.screenshot({ clip });
-
   const moved = Math.hypot(...camAfter.map((v, i) => v - camBefore[i]));
   check(moved > 0.05, `drag orbits the camera (moved ${moved.toFixed(3)})`);
   check(!before.equals(after), 'the view repaints after a drag');
-  check(
-    (await page.evaluate(() => window.__menger.state.level)) === 3,
-    'dragging the canvas does not touch the controls',
-  );
+  check((await probe(page)).level === 5, 'dragging the canvas does not touch the controls');
+  // An orbit changes what is visible, so it must bring a rebuild with it.
+  await settle(page);
+  check(await coverage(page) > 0.02, 'the model is rebuilt for the new angle');
 
-  // Palette switch.
+  // Palette switch is a uniform change on the GPU.
   await page.click('#palette button[data-value="ember"]');
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(200);
   check(
     await page.getAttribute('#palette button[data-value="ember"]', 'aria-checked') === 'true',
     'palette switches to ember',
   );
   await page.screenshot({ path: join(shots, `${name}-ember.png`) });
 
+  // Detail: High splits finer than Low.
+  await page.click('#detail button[data-value="low"]');
+  await settle(page);
+  const low = await probe(page);
+  await page.click('#detail button[data-value="high"]');
+  await settle(page);
+  const high = await probe(page);
+  console.log(`       detail low ${low.cubes} cubes @ ${low.threshold.toFixed(1)}px, high ${high.cubes} @ ${high.threshold.toFixed(1)}px`);
+  check(high.cubes > low.cubes, 'High detail builds more cubes than Low');
+  check(high.threshold < low.threshold, 'High detail splits cubes finer than Low');
+  await page.screenshot({ path: join(shots, `${name}-high.png`) });
+  await page.click('#detail button[data-value="medium"]');
+  await settle(page);
+
   // Cutaway reveals the interior.
   await page.fill('#cut', '55');
   await page.dispatchEvent('#cut', 'input');
-  await page.waitForTimeout(300);
+  await settle(page);
   check(await page.locator('#cut-out').textContent() === '55%', 'cutaway reports 55%');
-  const cutCoverage = await canvasHasModel(page);
-  check(cutCoverage < coverage, `cutaway removes geometry (${(cutCoverage * 100).toFixed(1)}%)`);
+  const cutCoverage = await coverage(page);
+  check(cutCoverage < full, `cutaway removes geometry (${(cutCoverage * 100).toFixed(1)}%)`);
   await page.screenshot({ path: join(shots, `${name}-cutaway.png`) });
   await page.fill('#cut', '0');
   await page.dispatchEvent('#cut', 'input');
+  await settle(page);
 
-  // Zoom: the slider must dive, deepen, and keep the cost bounded.
-  const atRest = await page.evaluate(() => ({
-    zoom: window.__menger.zoom, depth: window.__menger.depth, faces: window.__menger.faceCount,
-  }));
-  check(Math.abs(atRest.zoom - 1) < 0.02, `starts at 1x (${atRest.zoom.toFixed(2)})`);
-  check(atRest.depth === 3, `starts at depth 3 (got ${atRest.depth})`);
-
+  // Zoom: the slider must dive, deepen, and stay bounded.
   const dives = [];
   for (const slider of [250, 500, 750, 1000]) {
     await page.fill('#zoom', String(slider));
     await page.dispatchEvent('#zoom', 'input');
-    await page.waitForFunction(
-      (want) => !document.getElementById('save-stl').disabled
-        && window.__menger.depth >= want,
-      3 + Math.round(Math.log(3 ** (12 * slider / 1000)) / Math.log(3)) - 1,
-      { timeout: 30000 },
-    );
-    dives.push(await page.evaluate(() => ({
-      zoom: window.__menger.zoom,
-      depth: window.__menger.depth,
-      faces: window.__menger.faceCount,
-      focus: window.__menger.focus,
-    })));
+    await settle(page);
+    dives.push(await probe(page));
   }
   for (const d of dives) {
-    console.log(`       zoom ${Math.round(d.zoom)}x -> depth ${d.depth}, ${d.faces} faces`);
+    console.log(`       zoom ${Math.round(d.zoom)}x -> depths ${d.depthMin}-${d.depth}, ` +
+      `${d.cubes} cubes, finest ${d.threshold.toFixed(1)}px`);
   }
   const deepest = dives[dives.length - 1];
   check(deepest.zoom > 100000, `slider reaches deep zoom (${Math.round(deepest.zoom)}x)`);
-  check(deepest.depth >= 12, `depth follows zoom (${deepest.depth})`);
-  check(
-    deepest.focus.some((v) => v !== 0),
-    `zoom aimed at the surface (${deepest.focus.map((v) => v.toFixed(3))})`,
-  );
-  const worst = Math.max(...dives.map((d) => d.faces));
-  check(worst < 600000, `deep zoom stays bounded (worst ${worst} faces)`);
-  check(await canvasHasModel(page) > 0.02, 'geometry is still drawn at full zoom');
-  await page.screenshot({ path: join(shots, `${name}-zoom.png`) });
+  check(deepest.depth >= 14, `depth follows zoom (${deepest.depth})`);
+  check(deepest.depth - deepest.depthMin >= 6,
+    `many iterations on screen at once (${deepest.depthMin}-${deepest.depth})`);
+  check(deepest.focus.some((v) => v !== 0),
+    `zoom aimed at the surface (${deepest.focus.map((v) => v.toFixed(3))})`);
+  check(Math.max(...dives.map((d) => d.cubes)) <= 220000, 'the cube budget holds at every zoom');
 
-  // New detail, not a magnified version of the same cubes.
-  check(
-    deepest.depth > atRest.depth + 8,
-    `zoom generated ${deepest.depth - atRest.depth} extra iterations`,
-  );
+  // The surface is seen at an angle and fills the whole view here. A build
+  // that stops at a box around the focus leaves a hard edge and bare background
+  // inside the picture; this is the regression check for that.
+  const free = await page.evaluate(() => window.__menger.visibleRect());
+  const filled = await coverage(page, free);
+  console.log(`       free canvas covered at full zoom: ${(filled * 100).toFixed(1)}%`);
+  check(filled > 0.9, `geometry reaches the edges of the view (${(filled * 100).toFixed(1)}% covered)`);
+  await page.screenshot({ path: join(shots, `${name}-zoom.png`) });
 
   await page.fill('#zoom', '0');
   await page.dispatchEvent('#zoom', 'input');
-  await page.waitForFunction(() => window.__menger.zoom < 1.02, null, { timeout: 20000 });
-  await page.waitForFunction(() => !document.getElementById('save-stl').disabled, null, { timeout: 20000 });
+  await page.click('#reset');
+  await settle(page);
+  check((await probe(page)).zoom < 1.02, 'reset returns to 1x');
 
-  // Level 4: the heaviest build the UI allows.
-  await page.click('#level-up');
-  await page.waitForFunction(
-    () => /160,000 cubes/.test(document.getElementById('stats').textContent),
-    null, { timeout: 30000 });
-  const heavy = await page.locator('#stats').textContent();
-  console.log(`       stats: ${heavy}`);
-  check(heavy.includes('672,768 tris'), 'level 4 builds 672,768 triangles');
-  check(
-    (await page.locator('#level-note').textContent()).includes('heavy'),
-    'level 4 warns that it is heavy',
-  );
-  check(await page.isDisabled('#level-up'), 'level cannot exceed the cap');
-  await page.screenshot({ path: join(shots, `${name}-level4.png`) });
+  // One flick from 1x to the end: the focus has to be walked down every level
+  // in between, or it lands in a hole carved at some intermediate scale.
+  await page.fill('#zoom', '1000');
+  await page.dispatchEvent('#zoom', 'input');
+  await settle(page);
+  const flick = await probe(page);
+  const flickFilled = await coverage(page, await page.evaluate(() => window.__menger.visibleRect()));
+  console.log(`       flick to ${Math.round(flick.zoom)}x -> depths ${flick.depthMin}-${flick.depth}, ` +
+    `${flick.cubes} cubes, ${(flickFilled * 100).toFixed(1)}% covered`);
+  check(flick.depth >= 14 && flickFilled > 0.9, 'a single flick to full zoom lands on solid structure');
+  await page.fill('#zoom', '0');
+  await page.dispatchEvent('#zoom', 'input');
+  await page.click('#reset');
+  await settle(page);
 
-  await page.click('#level-down');
-  await page.waitForFunction(
-    () => /8,000 cubes/.test(document.getElementById('stats').textContent), null, { timeout: 20000 });
+  // Level 0 is a single cube, whatever else is going on.
+  for (let i = 0; i < 5; i++) await page.click('#level-down');
+  await settle(page);
+  const zero = await probe(page);
+  check(zero.cubes === 1 && zero.depth === 0, `level 0 is one cube (${zero.cubes} at depth ${zero.depth})`);
+  check(await page.isDisabled('#level-down'), 'level cannot go below 0');
 
-  // Exports.
+  // Exports at level 3: one depth, printable, 100 mm across.
+  for (let i = 0; i < 3; i++) await page.click('#level-up');
+  await settle(page);
   for (const [selector, extension] of [['#save-png', 'png'], ['#save-stl', 'stl'], ['#save-obj', 'obj']]) {
     const [download] = await Promise.all([
-      page.waitForEvent('download', { timeout: 20000 }),
+      page.waitForEvent('download', { timeout: 30000 }),
       page.click(selector),
     ]);
     const file = join(shots, download.suggestedFilename());
@@ -250,13 +287,19 @@ async function run(name, contextOptions) {
       download.suggestedFilename() === `menger-d3.${extension}` && size > 1000,
       `${extension.toUpperCase()} downloads as ${download.suggestedFilename()} (${size} bytes)`,
     );
+    if (extension === 'stl') {
+      // A whole level-3 sponge, not the view's culled, mixed-depth mesh.
+      check(size === 84 + 50 * 36096, `STL is the complete level-3 solid (${size} bytes)`);
+    }
+    await page.waitForFunction(() => !document.getElementById('save-stl').disabled);
   }
 
   // Shared state survives a reload.
   await page.click('#palette button[data-value="bone"]');
   await page.waitForTimeout(400);
   const hash = new URL(page.url()).hash;
-  check(hash.includes('p=bone'), `url carries the state (${hash})`);
+  check(hash.includes('p=bone') && hash.includes('l=3') && hash.includes('d=medium'),
+    `url carries the state (${hash})`);
   await page.reload({ waitUntil: 'load' });
   await page.waitForFunction(() => window.__mengerBooted === true, null, { timeout: 20000 });
   check(

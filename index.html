@@ -48,15 +48,16 @@
     <div class="field">
       <div class="field__head">
         <label for="level">Iterations</label>
-        <output id="level-out" for="level">3</output>
+        <output id="level-out" for="level">5</output>
       </div>
       <div class="stepper">
         <button id="level-down" type="button" aria-label="Fewer iterations">−</button>
-        <input id="level" type="range" min="0" max="4" step="1" value="3" aria-describedby="level-note">
+        <input id="level" type="range" min="0" max="7" step="1" value="5" aria-describedby="level-note">
         <button id="level-up" type="button" aria-label="More iterations">+</button>
       </div>
-      <p id="level-note" class="note">8,000 cubes</p>
-      <p class="note">Detail at 1&times;. Zooming in adds one iteration per 3&times;.</p>
+      <p id="level-note" class="note">Deepest level at 1&times; &middot; 3,200,000 cubes if built whole</p>
+      <p class="note">Zooming in adds one per 3&times;. Near things get the deepest levels,
+      far things fewer, so many iterations show at once.</p>
     </div>
 
     <div class="field">
@@ -66,6 +67,16 @@
       </div>
       <input id="zoom" type="range" min="0" max="1000" step="1" value="0" aria-describedby="zoom-note">
       <p id="zoom-note" class="note">Depth 3 &middot; tap the sponge to aim</p>
+    </div>
+
+    <div class="field">
+      <span class="field__head" id="detail-label">Detail</span>
+      <div class="pills" role="radiogroup" aria-labelledby="detail-label" id="detail">
+        <button type="button" role="radio" data-value="low" aria-checked="false">Low</button>
+        <button type="button" role="radio" data-value="medium" aria-checked="true">Medium</button>
+        <button type="button" role="radio" data-value="high" aria-checked="false">High</button>
+      </div>
+      <p id="detail-note" class="note">&nbsp;</p>
     </div>
 
     <div class="field">
@@ -96,15 +107,15 @@
       <button id="reset" class="btn" type="button">Reset view</button>
     </div>
 
-    <div class="field">
+    <div class="field" id="export-field">
       <span class="field__head">Export</span>
       <div class="row">
         <button id="save-png" class="btn" type="button">PNG</button>
         <button id="save-stl" class="btn" type="button">STL</button>
         <button id="save-obj" class="btn" type="button">OBJ</button>
       </div>
-      <p class="note">STL and OBJ export whatever is built, scaled to 100&nbsp;mm across &mdash;
-      zoomed in, that is the slice you are looking at.</p>
+      <p class="note">STL and OBJ are solid, printable meshes at one depth, 100&nbsp;mm across
+      &mdash; the whole sponge at 1&times;, the slice around the focus when zoomed in.</p>
     </div>
 
   </div>

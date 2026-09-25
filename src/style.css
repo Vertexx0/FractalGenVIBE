@@ -63,6 +63,25 @@ html, body {
   pointer-events: none;
 }
 
+/* Zoomed in, geometry fills the screen behind the heading; a scrim keeps it
+   legible without boxing it in. Drawn as a pseudo-element so it does not
+   change the heading's box, which the camera framing measures. */
+#hud::before {
+  content: "";
+  position: absolute;
+  top: calc(-1 * (var(--safe-t) + 10px));
+  right: calc(-1 * (var(--safe-r) + 14px));
+  bottom: -36px;
+  left: calc(-1 * (var(--safe-l) + 14px));
+  z-index: -1;
+  background: linear-gradient(to bottom,
+    rgba(11, 13, 18, 0.86) 0%,
+    rgba(11, 13, 18, 0.6) 55%,
+    rgba(11, 13, 18, 0) 100%);
+}
+
+#hud h1, #stats { text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7); }
+
 #hud h1 {
   margin: 0;
   font-size: 17px;

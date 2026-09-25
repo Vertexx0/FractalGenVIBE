@@ -5,32 +5,53 @@
  * the GPU, the render loop sleeps when the camera is still, and pixel ratio is
  * trimmed as the mesh grows.
  *
- * Zoom is the interesting part. Rather than building a deeper sponge — level 8
- * would be 25 billion cubes — it builds only the region in front of the camera,
- * one iteration deeper for every 3x of magnification. The region shrinks at the
- * same rate the depth grows, so the cost of a view is the same at 1x and at
- * 500,000x, and the detail never runs out.
+ * What gets built is what the camera can see (see buildViewMesh): cubes are
+ * split while they are large on screen, culled when outside the view or behind
+ * the surface in front, and left coarse when far away. Near structure therefore
+ * runs many iterations deeper than distant structure, and a single view shows
+ * depths from the whole sponge down to cubes a few pixels wide. Zooming raises
+ * the ceiling by one iteration per 3x, so the detail never runs out.
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  buildRegionMesh, raycastSponge, spongeStats,
-  FRACTAL_DIMENSION, HARD_MAX_DEPTH,
+  buildViewMesh, buildRegionMesh, raycastSponge, HARD_MAX_DEPTH,
 } from './menger.js';
 import { toBinarySTL, toOBJChunks, stlByteLength, formatBytes } from './exporters.js';
 
-/** Ceiling for the base detail slider. Zoom takes it deeper from there. */
-const UI_MAX_LEVEL = 4;
+/** Ceiling for the iterations slider: the deepest level allowed at 1x. */
+const UI_MAX_LEVEL = 7;
 /** Longest edge of an exported model, in millimetres. */
 const EXPORT_MM = 100;
+/** Most cubes in an exported mesh; deeper requests drop a level to fit. */
+const EXPORT_BUDGET = 260000;
 /** Deepest dive the zoom slider reaches: 3^12, or one iteration per 3x. */
 const MAX_ZOOM = 3 ** 12;
-/**
- * How much wider than the view the built region is. Every extra bit is geometry
- * you cannot see, but without it the region's cut edges show at the margins.
- */
+/** Half-width of the neighbourhood the zoom aims within and exports, in view heights. */
 const REGION_MARGIN = 1.4;
+/**
+ * How much wider than the view the culling frustum is. The spare ring is
+ * geometry you cannot see yet, and it is what keeps a small orbit from
+ * opening a gap at the screen edge before the next build lands.
+ */
+const CULL_FOV_SCALE = 1.3;
+/** Nothing further than this many focus-distances away is built or drawn. */
+const FAR_FACTOR = 300;
+/** Orbit this far, or dolly by this ratio, and the view is rebuilt. */
+const REBUILD_ANGLE = Math.cos((4 * Math.PI) / 180);
+const REBUILD_DOLLY = 1.15;
 const PALETTES = ['depth', 'axis', 'ember', 'bone'];
+
+/**
+ * Detail presets scale the cube budget and set the smallest cube worth
+ * splitting. Phones start from a smaller budget than laptops.
+ */
+const BASE_BUDGET = window.matchMedia('(pointer: coarse)').matches ? 110000 : 200000;
+const DETAILS = {
+  low: { budget: 0.45, minPixels: 4 },
+  medium: { budget: 1, minPixels: 2.5 },
+  high: { budget: 1.9, minPixels: 1.75 },
+};
 
 const num = new Intl.NumberFormat();
 const $ = (id) => document.getElementById(id);
@@ -52,6 +73,8 @@ const el = {
   zoom: $('zoom'),
   zoomOut: $('zoom-out'),
   zoomNote: $('zoom-note'),
+  detail: $('detail'),
+  detailNote: $('detail-note'),
   palette: $('palette'),
   cut: $('cut'),
   cutOut: $('cut-out'),
@@ -65,7 +88,8 @@ const el = {
 };
 
 const state = {
-  level: 3,
+  level: 5,
+  detail: 'medium',
   palette: 'depth',
   cut: 0,
   cutAxis: 'x',
@@ -74,145 +98,129 @@ const state = {
 
 /**
  * The world point the camera orbits, and the origin every vertex is measured
- * from. A cube at depth 12 is two millionths of the sponge wide; in absolute
- * float32 coordinates it would round away to nothing, so the origin travels
- * with the view and the mantissa is spent on detail instead of on position.
+ * from. A cube at depth 15 is 7e-8 of the sponge wide; in absolute float32
+ * coordinates it would round away to nothing, so the origin travels with the
+ * view and the mantissa is spent on detail instead of on position.
  */
 let focus = [0, 0, 0];
 /** Where the geometry currently on the GPU was centred. */
 let meshCenter = [0, 0, 0];
 let currentMesh = null;
+/** The camera and settings the current mesh was built for. */
+let built = null;
+/** Last build's pixel threshold: the next build's starting guess. */
+let thresholdHint = 6;
 let building = false;
 let needsRender = true;
 
-/** Phones get a smaller cube budget than laptops; both are hard ceilings. */
-const DEVICE_BUDGET = window.matchMedia('(pointer: coarse)').matches ? 120000 : 220000;
-
 // ---------------------------------------------------------------- palettes
 
-const srgbToLinear = (c) =>
-  c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-
-/** Gradient stops given in sRGB 0-255, pre-converted to the linear values
- *  three.js expects for vertex colours so the per-vertex loop stays cheap. */
-function ramp(stops) {
-  return stops.map(([at, r, g, b]) => [
-    at,
-    srgbToLinear(r / 255),
-    srgbToLinear(g / 255),
-    srgbToLinear(b / 255),
-  ]);
-}
-
+/** Gradient stops in sRGB 0-255, from deep inside the sponge to its rim. */
 const RAMPS = {
-  depth: ramp([
+  depth: [
     [0.0, 18, 32, 66],
     [0.45, 44, 128, 196],
     [0.75, 124, 198, 255],
     [1.0, 236, 248, 255],
-  ]),
-  ember: ramp([
+  ],
+  ember: [
     [0.0, 46, 12, 22],
     [0.4, 178, 44, 42],
     [0.72, 244, 140, 40],
     [1.0, 255, 232, 156],
-  ]),
-  bone: ramp([
+  ],
+  bone: [
     [0.0, 96, 100, 112],
     [0.6, 208, 210, 214],
     [1.0, 250, 250, 248],
-  ]),
+  ],
 };
 
-function sampleRamp(stops, t) {
-  t = t < 0 ? 0 : t > 1 ? 1 : t;
-  for (let i = 1; i < stops.length; i++) {
-    if (t <= stops[i][0]) {
-      const [a0, r0, g0, b0] = stops[i - 1];
-      const [a1, r1, g1, b1] = stops[i];
-      const k = a1 === a0 ? 0 : (t - a0) / (a1 - a0);
-      return [r0 + (r1 - r0) * k, g0 + (g1 - g0) * k, b0 + (b1 - b0) * k];
-    }
+/**
+ * A ramp as a 256-texel strip. The shading value comes from the geometry (see
+ * shadeVertex), and the palette is looked up per pixel on the GPU — so
+ * switching palette is a texture swap, not a pass over a million vertices.
+ */
+function rampTexture(stops) {
+  const data = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 1;
+    while (k < stops.length - 1 && t > stops[k][0]) k++;
+    const [a0, ...c0] = stops[k - 1];
+    const [a1, ...c1] = stops[k];
+    const f = a1 === a0 ? 0 : clamp((t - a0) / (a1 - a0), 0, 1);
+    for (let c = 0; c < 3; c++) data[i * 4 + c] = Math.round(c0[c] + (c1[c] - c0[c]) * f);
+    data[i * 4 + 3] = 255;
   }
-  const last = stops[stops.length - 1];
-  return [last[1], last[2], last[3]];
+  const texture = new THREE.DataTexture(data, 256, 1, THREE.RGBAFormat);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+const rampTextures = Object.fromEntries(
+  Object.entries(RAMPS).map(([name, stops]) => [name, rampTexture(stops)]));
+
+const paletteUniforms = {
+  uRamp: { value: rampTextures.depth },
+  uAxis: { value: 0 },
+};
+
+function applyPalette() {
+  paletteUniforms.uRamp.value = rampTextures[state.palette] || rampTextures.depth;
+  paletteUniforms.uAxis.value = state.palette === 'axis' ? 1 : 0;
+  needsRender = true;
 }
 
 /**
- * Vertex colours derived from world position, stretched over the region's own
- * range.
- *
- * Shading by distance from the sponge's centre puts the light on the outer
- * shell and lets the tunnels fall into shadow — but a slice at 500,000x sits
- * entirely at one distance from that centre, so the gradient would collapse and
- * the whole view would come out a single flat tone. Rescaling to the range
- * actually present keeps the same reading at every zoom.
+ * Standard physically based shading with the base colour replaced: a ramp
+ * lookup on the per-vertex `shade` value, or — for `axis` — a colour per face
+ * direction, darkened by the same value. Both read the same at any zoom,
+ * because `shade` measures depth within a cube's own nested blocks.
  */
-function paintColors(mesh, palette) {
-  const { positions, center } = mesh;
-  const colors = new Float32Array(positions.length);
-  if (positions.length === 0) return colors;
-
-  if (palette === 'axis') {
-    const lo = [Infinity, Infinity, Infinity];
-    const hi = [-Infinity, -Infinity, -Infinity];
-    for (let p = 0; p < positions.length; p += 3) {
-      for (let a = 0; a < 3; a++) {
-        const v = positions[p + a];
-        if (v < lo[a]) lo[a] = v;
-        if (v > hi[a]) hi[a] = v;
-      }
-    }
-    // A degenerate axis (a flat slab) keeps a mid tone rather than exploding.
-    const span = lo.map((v, a) => Math.max(hi[a] - v, 1e-12));
-    for (let p = 0; p < positions.length; p += 3) {
-      for (let a = 0; a < 3; a++) {
-        const t = hi[a] - lo[a] < 1e-9 ? 0.5 : (positions[p + a] - lo[a]) / span[a];
-        colors[p + a] = srgbToLinear(0.08 + t * 0.9);
-      }
-    }
-    return colors;
-  }
-
-  const stops = RAMPS[palette] || RAMPS.depth;
-  const count = positions.length / 3;
-  const signal = new Float32Array(count);
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (let i = 0, p = 0; i < count; i++, p += 3) {
-    const x = positions[p] + center[0];
-    const y = positions[p + 1] + center[1];
-    const z = positions[p + 2] + center[2];
-    const ax = x < 0 ? -x : x;
-    const ay = y < 0 ? -y : y;
-    const az = z < 0 ? -z : z;
-    // Chebyshev distance from the centre: 1 on the outer shell, 0 at the core.
-    const s = (ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az)) * 2;
-    signal[i] = s;
-    if (s < lo) lo = s;
-    if (s > hi) hi = s;
-  }
-
-  const span = hi - lo;
-  // The dark end of each ramp means "deep inside the sponge". A zoomed-in
-  // region is all surface, so mapping it down there would render the whole view
-  // in shadow; as the region's share of the global range shrinks, so does how
-  // far into the dark end it is allowed to reach.
-  const floor = 0.42 * (1 - Math.min(1, span / 0.6));
-  for (let i = 0, p = 0; i < count; i++, p += 3) {
-    const local = span < 1e-9 ? 0.75 : (signal[i] - lo) / span;
-    const t = floor + (1 - floor) * local;
-    const [r, g, b] = sampleRamp(stops, t);
-    colors[p] = r;
-    colors[p + 1] = g;
-    colors[p + 2] = b;
-  }
-  return colors;
+function shadeMaterial() {
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.62,
+    metalness: 0.06,
+  });
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, paletteUniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>
+attribute float shade;
+varying float vShade;
+varying vec3 vFaceNormal;`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+vShade = shade;
+vFaceNormal = normal;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+uniform sampler2D uRamp;
+uniform float uAxis;
+varying float vShade;
+varying vec3 vFaceNormal;`)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+float shadeT = clamp(vShade * 0.88 + 0.12, 0.0, 1.0);
+vec3 tint = texture2D(uRamp, vec2(shadeT, 0.5)).rgb;
+if (uAxis > 0.5) {
+  vec3 n = abs(vFaceNormal);
+  vec3 axisColor = n.x > 0.5 ? vec3(0.86, 0.19, 0.16)
+    : n.y > 0.5 ? vec3(0.22, 0.62, 0.26) : vec3(0.14, 0.33, 0.9);
+  tint = axisColor * (0.2 + 0.8 * shadeT);
+}
+diffuseColor.rgb *= tint;`);
+  };
+  material.customProgramCacheKey = () => 'menger-shade';
+  return material;
 }
 
 // ------------------------------------------------------------------- scene
 
-let renderer, scene, camera, controls, material, innerMaterial, shell, inner;
+let renderer, scene, camera, controls, material, innerMaterial, shell, inner, fog;
 let geometry = null;
 const clipPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0.5);
 /** Default viewing direction. The distance comes from the layout, not a guess. */
@@ -234,6 +242,10 @@ function initScene() {
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b0d12);
+  // Distant, coarse structure fades into the background, which reads as depth
+  // and keeps the far plane from ever showing as an edge.
+  fog = new THREE.Fog(0x0b0d12, 10, 100);
+  scene.fog = fog;
 
   camera = new THREE.PerspectiveCamera(46, 1, 0.04, 8);   // rescaled per frame
   camera.position.copy(HOME_DIR).multiplyScalar(baseDistance);
@@ -253,11 +265,7 @@ function initScene() {
   fill.position.set(-2.4, -1.2, -1.8);
   scene.add(fill);
 
-  material = new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    roughness: 0.62,
-    metalness: 0.06,
-  });
+  material = shadeMaterial();
 
   // The sponge is a closed shell, so its back faces are invisible until the
   // cutaway opens it. Shading them separately and darker is what makes a slice
@@ -295,17 +303,21 @@ function initScene() {
 }
 
 /**
- * Keep the near and far planes wrapped tightly around the region.
+ * Keep the near and far planes, and the fog, scaled to the camera's distance
+ * from the focus.
  *
- * At half a million times magnification the camera sits five millionths of a
- * unit from the surface. Fixed planes would span eight orders of magnitude, and
- * the depth buffer resolves none of it — the model renders as nothing at all.
- * Scaling them with the dive holds the ratio near 170 at every zoom.
+ * At half a million times magnification the camera sits a few millionths of a
+ * unit from the surface. Planes fixed in world units would span many orders of
+ * magnitude and the depth buffer would resolve none of it; scaled with the
+ * dive, their ratio holds at FAR_FACTOR * 40 at every zoom. The builder uses
+ * the same far distance, so nothing is built that would not be drawn.
  */
 function updateCameraClip() {
   const distance = camera.position.length();
-  const near = Math.max(1e-9, distance / 50);
-  const far = distance * 3.4 + 0.01;
+  const near = Math.max(1e-10, distance / 40);
+  const far = distance * FAR_FACTOR;
+  fog.near = distance * 6;
+  fog.far = distance * 150;
   if (camera.near === near && camera.far === far) return;
   camera.near = near;
   camera.far = far;
@@ -363,12 +375,14 @@ function frameCamera(refit = false) {
     focus = [0, 0, 0];
     camera.position.copy(HOME_DIR).multiplyScalar(baseDistance);
     controls.target.set(0, 0, 0);
+    placeMesh();
   } else {
     camera.position.setLength(baseDistance / previousZoom);
   }
   controls.update();
   syncZoomUI();
   needsRender = true;
+  scheduleRebuild();
 }
 
 function resize() {
@@ -381,7 +395,7 @@ function resize() {
 
 /** Big meshes get fewer pixels: fill rate is the wall on mobile, not triangles. */
 function tunePixelRatio(faceCount) {
-  const cap = faceCount > 200000 ? 1.5 : 2;
+  const cap = faceCount > 300000 ? 1.5 : 2;
   const dpr = Math.min(window.devicePixelRatio || 1, cap);
   if (renderer.getPixelRatio() !== dpr) {
     renderer.setPixelRatio(dpr);
@@ -399,12 +413,13 @@ const sliderToZoom = (t) => MAX_ZOOM ** (t / 1000);
 const zoomToSlider = (z) => (Math.log(z) / Math.log(MAX_ZOOM)) * 1000;
 
 /**
- * What to build for the view as it stands.
+ * The depth ceiling for the view as it stands, and the scale of the
+ * neighbourhood around the focus.
  *
  * One extra iteration per 3x is the natural rate: each iteration divides a cube
- * into thirds, so the cubes hold a steady size on screen however far you dive.
- * The budget is a floor on quality, not a target — if a region turns out denser
- * than the device can take, the builder drops a level on its own.
+ * into thirds, so the finest cubes hold a steady size on screen however far
+ * you dive. The builder decides how much of that ceiling each part of the view
+ * actually reaches.
  */
 function currentRegion() {
   const distance = camera.position.length();
@@ -412,10 +427,9 @@ function currentRegion() {
   const steps = Math.max(0, Math.round(Math.log(zoom) / Math.log(3)));
   return {
     zoom,
+    distance,
     depth: Math.min(HARD_MAX_DEPTH, state.level + steps),
-    center: focus,
     halfExtent: REGION_MARGIN * distance * Math.tan((camera.fov * Math.PI) / 360),
-    budget: Math.max(20 ** state.level, DEVICE_BUDGET),
   };
 }
 
@@ -425,7 +439,7 @@ function currentRegion() {
  *
  * The camera keeps its world position, so the picture does not jump — the point
  * being aimed at was already under the finger. What changes is what the camera
- * pivots and dives towards, and where the next region gets generated.
+ * pivots and dives towards.
  */
 function aimAlong(direction, schedule = true) {
   const region = currentRegion();
@@ -436,7 +450,7 @@ function aimAlong(direction, schedule = true) {
     focus[2] + camera.position.z,
   ];
 
-  // Only march the stretch of ray near the region — at depth 12 a full sweep of
+  // Only march the stretch of ray near the focus — at depth 12 a full sweep of
   // the sponge at cell resolution would be millions of steps.
   const reach = 3 * region.halfExtent;
   const from = Math.max(0, distance - reach);
@@ -482,8 +496,41 @@ function aimAt(ndcX, ndcY, schedule = true) {
   return aimAlong(target.sub(camera.position).normalize(), schedule);
 }
 
-/** Depth the focus was last checked against; see the re-aim in rebuild(). */
+/** Depth the focus was last checked against; see diveFocus. */
 let aimedDepth = null;
+
+/**
+ * Walk the focus down to `toDepth` one level at a time, keeping it on solid
+ * material the whole way.
+ *
+ * The sponge has zero volume: a point that is solid at depth 5 has almost
+ * certainly been carved away by depth 15, and the hole it falls into may have
+ * been cut at any scale in between. Re-aiming only at the final depth, from a
+ * camera a few millionths of a unit away, cannot see out of a hole cut at depth
+ * 8. So each level is aimed from the distance at which that level is the
+ * ceiling — close enough to resolve it, far enough to see past the holes of
+ * the level before. This is what stepping the slider did implicitly; a flick
+ * straight to the end has to do it explicitly.
+ */
+function diveFocus(fromDepth, toDepth) {
+  const dir = camera.position.clone().normalize().toArray();   // focus -> camera
+  const back = dir.map((d) => -d);
+  const tanHalf = Math.tan((camera.fov * Math.PI) / 360);
+  let moved = false;
+  for (let depth = Math.max(fromDepth + 1, state.level + 1); depth <= toDepth; depth++) {
+    const distance = baseDistance / 3 ** (depth - state.level);
+    const eye = focus.map((f, a) => f + dir[a] * distance);
+    const reach = 3 * REGION_MARGIN * distance * tanHalf;
+    const from = Math.max(0, distance - reach);
+    const hit = raycastSponge(eye.map((e, a) => e + back[a] * from), back, depth,
+      distance + reach - from);
+    if (hit) {
+      focus = hit;
+      moved = true;
+    }
+  }
+  return moved;
+}
 
 function placeMesh() {
   const offset = [0, 1, 2].map((a) => meshCenter[a] - focus[a]);
@@ -499,10 +546,26 @@ function setZoom(zoom) {
   // sponge carves away — and from in there the ray finds nothing to aim at.
   if (next > 1.15 && focus[0] === 0 && focus[1] === 0 && focus[2] === 0) aimForward(false);
   camera.position.setLength(baseDistance / next);
+  followDive();
   controls.update();
   syncZoomUI();
   scheduleRebuild();
   needsRender = true;
+}
+
+/**
+ * Keep the focus on material as the depth ceiling rises. Zooming back out
+ * needs nothing: material at a fine depth is material at every coarser one,
+ * and the view builder refines whatever is near the camera regardless.
+ */
+function followDive() {
+  const region = currentRegion();
+  if (aimedDepth === null) aimedDepth = state.level;
+  if (region.depth > aimedDepth && region.depth > state.level) {
+    // The camera is positioned relative to the focus, so it follows along.
+    if (diveFocus(aimedDepth, region.depth)) placeMesh();
+  }
+  aimedDepth = region.depth;
 }
 
 // ------------------------------------------------------------ build queue
@@ -510,6 +573,7 @@ function setZoom(zoom) {
 let worker = null;
 let buildId = 0;
 const pending = new Map();
+const BUILDERS = { view: buildViewMesh, region: buildRegionMesh };
 
 function startWorker() {
   try {
@@ -521,10 +585,12 @@ function startWorker() {
       pending.delete(id);
       error ? settle.reject(new Error(error)) : settle.resolve(mesh);
     };
-    worker.onerror = () => {
-      // Module workers are unavailable (older Safari, file://): fall back inline.
+    worker.onerror = (event) => {
+      // Module workers are unavailable (older Safari, file://, sandboxes):
+      // fall back to building on the main thread.
+      event.preventDefault?.();
       worker = null;
-      for (const { params, resolve } of pending.values()) resolve(buildRegionMesh(params));
+      for (const { kind, params, resolve } of pending.values()) resolve(BUILDERS[kind](params));
       pending.clear();
     };
   } catch {
@@ -532,70 +598,142 @@ function startWorker() {
   }
 }
 
-function requestMesh(params) {
-  if (!worker) return Promise.resolve(buildRegionMesh(params));
+function requestMesh(kind, params) {
+  if (!worker) return Promise.resolve(BUILDERS[kind](params));
   const id = ++buildId;
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject, params });
-    worker.postMessage({ id, params });
+    pending.set(id, { resolve, reject, kind, params });
+    worker.postMessage({ id, kind, params });
   });
+}
+
+/** The cutaway plane for the current view, in coordinates relative to focus. */
+function currentClip() {
+  if (state.cut <= 0) return null;
+  const a = state.cutAxis === 'x' ? 0 : state.cutAxis === 'y' ? 1 : 2;
+  const half = Math.min(currentRegion().halfExtent, 0.5);
+  // 0 keeps everything, 100 leaves a sliver — never an empty screen.
+  const constant = half - (state.cut / 100) * 2 * half * 0.98;
+  return [a === 0 ? -1 : 0, a === 1 ? -1 : 0, a === 2 ? -1 : 0, constant];
+}
+
+const scratchMatrix = new THREE.Matrix4();
+const scratchFrustum = new THREE.Frustum();
+
+/** Everything the view builder needs to know about the camera, right now. */
+function viewParams(region) {
+  camera.updateMatrixWorld();
+  const cull = camera.clone();
+  cull.fov = Math.min(150, camera.fov * CULL_FOV_SCALE);
+  cull.updateProjectionMatrix();
+  scratchFrustum.setFromProjectionMatrix(
+    scratchMatrix.multiplyMatrices(cull.projectionMatrix, cull.matrixWorldInverse));
+  // Sides and near; the far plane is applied as a distance instead.
+  const planes = [0, 1, 2, 3, 5].map((i) => {
+    const { normal, constant } = scratchFrustum.planes[i];
+    return [normal.x, normal.y, normal.z, constant];
+  });
+  const detail = DETAILS[state.detail];
+  const halfV = Math.tan((camera.fov * Math.PI) / 360);
+  return {
+    origin: focus.slice(),
+    eye: camera.position.toArray(),
+    planes,
+    viewProjection: scratchMatrix
+      .multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).elements.slice(),
+    viewport: [window.innerWidth, window.innerHeight],
+    pixelsPerUnit: window.innerHeight / (2 * halfV),
+    maxDepth: region.depth,
+    budget: Math.round(BASE_BUDGET * detail.budget),
+    minPixels: detail.minPixels,
+    threshold: thresholdHint,
+    farDistance: region.distance * FAR_FACTOR,
+    focusDistance: region.distance,
+    falloff: 1,
+    clip: currentClip(),
+  };
+}
+
+/** Snapshot of what a build was for, to tell when it no longer fits. */
+function viewKey(region) {
+  return {
+    dir: camera.position.clone().normalize(),
+    distance: region.distance,
+    focus: focus.slice(),
+    depth: region.depth,
+    level: state.level,
+    detail: state.detail,
+    cut: `${state.cut}:${state.cutAxis}`,
+    width: window.innerWidth,
+    height: window.innerHeight,
+  };
 }
 
 /** Is the geometry on screen still the right thing for where the camera is? */
 function stale() {
-  if (!currentMesh) return true;
+  if (!currentMesh || !built) return true;
   const region = currentRegion();
-  if (region.depth !== currentMesh.depth) return true;
-  for (let a = 0; a < 3; a++) if (meshCenter[a] !== focus[a]) return true;
-  // Zoomed out past the built region, or far enough in to be worth refining.
-  return region.halfExtent > currentMesh.halfExtent * 1.02
-    || region.halfExtent < currentMesh.halfExtent * 0.45;
+  if (built.depth !== region.depth || built.level !== state.level
+    || built.detail !== state.detail || built.cut !== `${state.cut}:${state.cutAxis}`
+    || built.width !== window.innerWidth || built.height !== window.innerHeight) return true;
+  for (let a = 0; a < 3; a++) if (built.focus[a] !== focus[a]) return true;
+  const ratio = region.distance / built.distance;
+  if (ratio > REBUILD_DOLLY || ratio < 1 / REBUILD_DOLLY) return true;
+  return camera.position.clone().normalize().dot(built.dir) < REBUILD_ANGLE;
 }
 
-let rebuildTimer;
-/** Zoom fires continuously; only chase it once the gesture settles. */
+let rebuildTimer = null;
+/**
+ * Throttled, not debounced: during a long orbit the view keeps going stale, and
+ * waiting for the gesture to end would leave the edges bare the whole time.
+ */
 function scheduleRebuild(immediate = false) {
-  clearTimeout(rebuildTimer);
   if (!stale()) return;
-  rebuildTimer = setTimeout(rebuild, immediate ? 0 : 140);
+  if (immediate) {
+    clearTimeout(rebuildTimer);
+    rebuildTimer = null;
+    rebuild();
+    return;
+  }
+  if (rebuildTimer) return;
+  rebuildTimer = setTimeout(() => {
+    rebuildTimer = null;
+    rebuild();
+  }, 90);
 }
 
 /**
- * Build for the view as it stands, then build again if the view moved while we
- * were busy, so a slider sweep settles on where the finger stopped.
+ * Build for the view as it stands, then again if the view moved meanwhile.
+ * Orbit-driven rebuilds are silent; the spinner is for changes the viewer asked
+ * for and is waiting on.
  */
 async function rebuild() {
   if (building) return;
   building = true;
-  setExportsEnabled(false);
   try {
-    for (let attempt = 0; attempt < 6; attempt++) {
-      let region = currentRegion();
-      // The sponge has zero volume: a point solid at depth 5 has almost
-      // certainly been carved away by depth 15. Without re-aiming on the way
-      // down, a deep dive lands in a hole and builds nothing at all.
-      // Only once a dive has actually added depth — at rest the whole sponge is
-      // centred on the origin, and aiming there would knock it off centre.
-      if (region.depth !== aimedDepth) {
-        aimedDepth = region.depth;
-        if (region.depth > state.level && aimForward(false)) region = currentRegion();
-      }
-      setBusy(true, `Building depth ${region.depth}…`);
-      try {
-        const data = await requestMesh(region);
-        applyMesh(data);
-      } catch (error) {
-        toast(`Build failed: ${error.message}`);
-        break;
-      }
+    for (let attempt = 0; attempt < 4; attempt++) {
+      // Pinch and wheel zoom arrive here without passing through setZoom.
+      followDive();
+      const region = currentRegion();
+      const waiting = !built || built.depth !== region.depth || built.level !== state.level
+        || built.detail !== state.detail;
+      if (waiting) setBusy(true, `Building to depth ${region.depth}…`);
+      const key = viewKey(region);
+      const data = await requestMesh('view', viewParams(region));
+      thresholdHint = data.threshold;
+      built = key;
+      applyMesh(data);
       if (!stale()) break;
     }
+  } catch (error) {
+    toast(`Build failed: ${error.message}`);
   } finally {
     building = false;
     setBusy(false);
-    setExportsEnabled(true);
     syncStats();
     syncZoomUI();
+    syncDetailUI();
+    if (stale()) scheduleRebuild();
   }
 }
 
@@ -605,50 +743,44 @@ function applyMesh(data) {
   geometry?.dispose();
   geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
-  geometry.setAttribute('normal', new THREE.BufferAttribute(data.normals, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(paintColors(data, state.palette), 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(data.normals, 3, true));
+  geometry.setAttribute('shade', new THREE.BufferAttribute(data.shade, 1));
   geometry.setIndex(new THREE.BufferAttribute(data.indices, 1));
   geometry.computeBoundingSphere();
   shell.geometry = geometry;
   inner.geometry = geometry;
   placeMesh();
-  applyCut();
+  applyCut(false);
   tunePixelRatio(data.faceCount);
   needsRender = true;
 }
 
-function repaint() {
-  if (!currentMesh || !geometry) return;
-  const attr = geometry.getAttribute('color');
-  attr.array.set(paintColors(currentMesh, state.palette));
-  attr.needsUpdate = true;
-  needsRender = true;
-}
-
-/** The cut sweeps across whatever is built, so it still bites when zoomed in. */
-function applyCut() {
+/**
+ * The cut sweeps across the neighbourhood of the focus, so it still bites when
+ * zoomed in. The GPU clips immediately; the rebuild that follows fills in the
+ * interior the cut exposes, which the previous build had culled as hidden.
+ */
+function applyCut(rebuildAfter = true) {
+  const clip = currentClip();
   let planes = [];
-  if (state.cut > 0 && currentMesh) {
-    const axis = state.cutAxis;
-    const a = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
-    clipPlane.normal.set(a === 0 ? -1 : 0, a === 1 ? -1 : 0, a === 2 ? -1 : 0);
-    const half = Math.min(currentMesh.halfExtent, 0.5);
-    // 0 keeps everything, 100 leaves a sliver — never an empty screen.
-    clipPlane.constant = half - (state.cut / 100) * 2 * half * 0.98;
+  if (clip) {
+    clipPlane.normal.set(clip[0], clip[1], clip[2]);
+    clipPlane.constant = clip[3];
     planes = [clipPlane];
   }
   for (const m of [material, innerMaterial]) {
+    if (m.clippingPlanes?.length !== planes.length) m.needsUpdate = true;
     m.clippingPlanes = planes;
-    m.needsUpdate = true;
   }
   inner.visible = state.cut > 0;
   needsRender = true;
+  if (rebuildAfter) scheduleRebuild();
 }
 
 // ---------------------------------------------------------------------- UI
 
 let busyTimer;
-/** Held back briefly: most rebuilds finish faster than a spinner can read. */
+/** Held back: most builds finish faster than a spinner can read. */
 function setBusy(on, label = 'Building…') {
   clearTimeout(busyTimer);
   if (!on) {
@@ -656,7 +788,7 @@ function setBusy(on, label = 'Building…') {
     return;
   }
   el.busyLabel.textContent = label;
-  busyTimer = setTimeout(() => { el.busy.hidden = false; }, 120);
+  busyTimer = setTimeout(() => { el.busy.hidden = false; }, 250);
 }
 
 function setExportsEnabled(on) {
@@ -685,36 +817,40 @@ function wholeSpongeCubes(depth) {
   return total < 1e9 ? num.format(total) : total.toExponential(1).replace('e+', 'e');
 }
 
+const depthRange = (mesh) => (mesh.depthMin === mesh.depthMax
+  ? `depth ${mesh.depthMax}` : `depths ${mesh.depthMin}–${mesh.depthMax}`);
+
 function syncStats() {
-  const tris = currentMesh ? currentMesh.faceCount * 2 : 0;
-  const cubes = currentMesh ? currentMesh.cubeCount : 0;
-  const depth = currentMesh ? currentMesh.depth : state.level;
+  if (!currentMesh) return;
   el.stats.textContent =
-    `${num.format(cubes)} cubes · ${num.format(tris)} tris · depth ${depth} · ` +
-    `${formatZoom(currentZoom())} · dim ${FRACTAL_DIMENSION.toFixed(3)}`;
+    `${num.format(currentMesh.cubeCount)} cubes · ${num.format(currentMesh.faceCount * 2)} tris · ` +
+    `${depthRange(currentMesh)} · ${formatZoom(currentZoom())}`;
 }
 
 function syncZoomUI() {
   const zoom = currentZoom();
-  const depth = currentMesh ? currentMesh.depth : currentRegion().depth;
   el.zoom.value = String(Math.round(zoomToSlider(zoom)));
   el.zoomOut.textContent = formatZoom(zoom);
-  el.zoomNote.textContent = depth <= state.level
-    ? `Depth ${depth} · tap the sponge to aim`
-    : `Depth ${depth} · ${wholeSpongeCubes(depth)} cubes if built whole`;
+  const deepest = currentMesh ? currentMesh.depthMax : currentRegion().depth;
+  el.zoomNote.textContent = zoom < 1.5
+    ? `Tap the sponge to aim, then dive`
+    : `Depth ${deepest} at the focus · ${wholeSpongeCubes(deepest)} cubes if built whole`;
 }
 
 function syncLevelUI() {
-  const s = spongeStats(state.level);
   el.level.value = String(state.level);
   el.levelOut.textContent = String(state.level);
   el.levelDown.disabled = state.level <= 0;
   el.levelUp.disabled = state.level >= UI_MAX_LEVEL;
-  const heavy = state.level >= UI_MAX_LEVEL;
-  el.levelNote.textContent = heavy
-    ? `${num.format(s.cubeCount)} cubes · heavy on phones`
-    : `${num.format(s.cubeCount)} cubes`;
-  el.levelNote.dataset.warn = String(heavy);
+  el.levelNote.textContent =
+    `Deepest level at 1× · ${wholeSpongeCubes(state.level)} cubes if built whole`;
+}
+
+function syncDetailUI() {
+  setRadio(el.detail, state.detail);
+  const budget = Math.round(BASE_BUDGET * DETAILS[state.detail].budget);
+  const finest = currentMesh ? ` · finest cubes ~${currentMesh.threshold.toFixed(1)} px` : '';
+  el.detailNote.textContent = `Up to ${num.format(budget)} visible cubes${finest}`;
 }
 
 function syncCutUI() {
@@ -741,6 +877,7 @@ function setLevel(next) {
   const level = clamp(next, 0, UI_MAX_LEVEL);
   if (level === state.level) return;
   state.level = level;
+  aimedDepth = Math.min(aimedDepth ?? level, currentRegion().depth);
   syncLevelUI();
   syncZoomUI();
   writeHash();
@@ -760,11 +897,32 @@ function download(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
+/**
+ * The on-screen mesh is view-dependent — mixed depths, hidden parts culled —
+ * which is right for looking at and wrong for printing. Exports are built
+ * separately: one depth, closed, around the focus.
+ */
+async function exportMesh() {
+  const region = currentRegion();
+  return requestMesh('region', {
+    depth: region.depth,
+    center: focus.slice(),
+    halfExtent: region.halfExtent,
+    budget: EXPORT_BUDGET,
+  });
+}
+
 /** Scale so the exported piece is EXPORT_MM across, whole sponge or slice. */
 const exportScale = (mesh) => EXPORT_MM / Math.min(1, Math.max(2 * mesh.halfExtent, 1e-9));
 
-const exportName = (extension) =>
-  `menger-d${currentMesh.depth}${currentMesh.halfExtent < 0.5 ? '-slice' : ''}.${extension}`;
+const exportName = (depth, slice, extension) =>
+  `menger-d${depth}${slice ? '-slice' : ''}.${extension}`;
+
+/** Does the export neighbourhood stop short of the whole sponge? */
+const isSlice = () => {
+  const { halfExtent } = currentRegion();
+  return focus.some((f) => Math.abs(f) + 0.5 > halfExtent);
+};
 
 function savePNG() {
   // Render immediately before reading: without preserveDrawingBuffer (which
@@ -772,29 +930,31 @@ function savePNG() {
   renderer.render(scene, camera);
   el.canvas.toBlob((blob) => {
     if (!blob) return toast('Could not capture the canvas');
-    download(blob, exportName('png'));
+    download(blob, exportName(currentMesh ? currentMesh.depthMax : state.level, isSlice(), 'png'));
     toast(`Saved PNG · ${formatBytes(blob.size)}`);
   }, 'image/png');
 }
 
-function saveSTL() {
-  if (!currentMesh) return;
-  toast(`Writing STL · ${formatBytes(stlByteLength(currentMesh))}…`);
-  setTimeout(() => {
-    const buffer = toBinarySTL(currentMesh, exportScale(currentMesh));
-    download(new Blob([buffer], { type: 'model/stl' }), exportName('stl'));
-    toast(`Saved STL · ${formatBytes(buffer.byteLength)}`);
-  }, 30);
-}
-
-function saveOBJ() {
-  if (!currentMesh) return;
-  toast('Writing OBJ…');
-  setTimeout(() => {
-    const blob = new Blob(toOBJChunks(currentMesh, exportScale(currentMesh)), { type: 'model/obj' });
-    download(blob, exportName('obj'));
-    toast(`Saved OBJ · ${formatBytes(blob.size)}`);
-  }, 30);
+async function saveModel(extension) {
+  setExportsEnabled(false);
+  toast(`Building ${extension.toUpperCase()}…`);
+  try {
+    const mesh = await exportMesh();
+    const name = exportName(mesh.depth, isSlice(), extension);
+    let blob;
+    if (extension === 'stl') {
+      toast(`Writing STL · ${formatBytes(stlByteLength(mesh))}…`);
+      blob = new Blob([toBinarySTL(mesh, exportScale(mesh))], { type: 'model/stl' });
+    } else {
+      blob = new Blob(toOBJChunks(mesh, exportScale(mesh)), { type: 'model/obj' });
+    }
+    download(blob, name);
+    toast(`Saved ${extension.toUpperCase()} · ${formatBytes(blob.size)} · depth ${mesh.depth}`);
+  } catch (error) {
+    toast(`Export failed: ${error.message}`);
+  } finally {
+    setExportsEnabled(true);
+  }
 }
 
 // -------------------------------------------------------------- URL state
@@ -807,6 +967,7 @@ function readHash() {
     const level = Number(p.get('l'));
     if (Number.isInteger(level) && level >= 0 && level <= UI_MAX_LEVEL) state.level = level;
   }
+  if (p.has('d') && p.get('d') in DETAILS) state.detail = p.get('d');
   if (p.has('p') && PALETTES.includes(p.get('p'))) state.palette = p.get('p');
   if (p.has('c')) {
     const cut = Number(p.get('c'));
@@ -830,6 +991,7 @@ function writeHash() {
     const zoom = currentZoom();
     const p = new URLSearchParams({
       l: state.level,
+      d: state.detail,
       p: state.palette,
       c: state.cut,
       a: state.cutAxis,
@@ -889,9 +1051,16 @@ function bindUI() {
     writeHash();
   });
 
+  onRadioGroup(el.detail, (value) => {
+    state.detail = value;
+    syncDetailUI();
+    writeHash();
+    scheduleRebuild(true);
+  });
+
   onRadioGroup(el.palette, (value) => {
     state.palette = value;
-    repaint();
+    applyPalette();
     writeHash();
   });
 
@@ -917,15 +1086,15 @@ function bindUI() {
   });
 
   el.reset.addEventListener('click', () => {
-    aimedDepth = null;
+    aimedDepth = state.level;
     frameCamera(true);
     scheduleRebuild(true);
     writeHash();
   });
 
   el.savePng.addEventListener('click', savePNG);
-  el.saveStl.addEventListener('click', saveSTL);
-  el.saveObj.addEventListener('click', saveOBJ);
+  el.saveStl.addEventListener('click', () => saveModel('stl'));
+  el.saveObj.addEventListener('click', () => saveModel('obj'));
 
   bindAiming();
 }
@@ -939,30 +1108,40 @@ function boot() {
   el.sheet.dataset.open = 'true';
   el.level.max = String(UI_MAX_LEVEL);
   setRadio(el.palette, state.palette);
+  applyPalette();
   el.spin.setAttribute('aria-pressed', String(state.spin));
   controls.autoRotate = state.spin;
   el.cut.value = String(state.cut);
   syncLevelUI();
+  syncDetailUI();
   syncCutUI();
+  applyCut(false);
   if (startZoom > 1) camera.position.setLength(baseDistance / startZoom);
   controls.update();
   syncZoomUI();
-  syncStats();
 
   rebuild();
 
   // Forcing a frame is also how the PNG export gets a readable buffer; exposing
   // it lets an automated run sample the canvas the same way.
   window.__menger = {
-    render: () => renderer.render(scene, camera),
+    render: () => {
+      updateCameraClip();
+      renderer.render(scene, camera);
+    },
     state,
     aimAt,
     setZoom,
     get zoom() { return currentZoom(); },
     get focus() { return focus.slice(); },
-    get depth() { return currentMesh ? currentMesh.depth : 0; },
+    get depth() { return currentMesh ? currentMesh.depthMax : 0; },
+    get depthMin() { return currentMesh ? currentMesh.depthMin : 0; },
+    get threshold() { return currentMesh ? currentMesh.threshold : 0; },
     get faceCount() { return currentMesh ? currentMesh.faceCount : 0; },
+    get cubeCount() { return currentMesh ? currentMesh.cubeCount : 0; },
+    get building() { return building || rebuildTimer !== null; },
     get camera() { return camera.position.toArray(); },
+    visibleRect,
   };
   window.__mengerBooted = true;
 }
