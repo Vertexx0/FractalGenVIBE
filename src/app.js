@@ -490,7 +490,9 @@ function aimForward(schedule = true) {
 /** Aim at a point the viewer touched. Canvas NDC is right here: three folds the
  *  view offset into the projection, so unproject already accounts for it. */
 function aimAt(ndcX, ndcY, schedule = true) {
-  // unproject reads matrixWorld, which is otherwise only refreshed at render.
+  // unproject reads matrixWorld and the projection, which are otherwise only
+  // refreshed at render.
+  updateCameraClip();
   camera.updateMatrixWorld();
   const target = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
   return aimAlong(target.sub(camera.position).normalize(), schedule);
@@ -622,6 +624,11 @@ const scratchFrustum = new THREE.Frustum();
 
 /** Everything the view builder needs to know about the camera, right now. */
 function viewParams(region) {
+  // The near plane scales with the dive, but only the render loop updates it.
+  // A build that runs before the next frame — a zoom flick, or any build on
+  // the main thread — would otherwise cull with the old near plane, which after
+  // a big dive lies beyond the new far limit: an empty view.
+  updateCameraClip();
   camera.updateMatrixWorld();
   const cull = camera.clone();
   cull.fov = Math.min(150, camera.fov * CULL_FOV_SCALE);
